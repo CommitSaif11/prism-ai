@@ -203,27 +203,67 @@ def download_json():
     )
 
 
+def detect_rat_type(data: dict) -> str:
+    lte = data.get("lteBands") or []
+    nr  = data.get("nrBands") or []
+
+    if len(lte) > 0 and len(nr) > 0:
+        return "dual"
+    elif len(nr) > 0:
+        return "nr"
+    elif len(lte) > 0:
+        return "eutra"
+    return "unknown"
+
+
 @app.post("/upload")
 async def upload(file: UploadFile = File(...)):
+    start_total = time.perf_counter()
+    
+    # ── Read file ──────────────────────────────────────────────
+    start = time.perf_counter()
     content = await file.read()
     text    = content.decode(errors="replace")
-    start   = time.time()
-
+    print(f"[TIME] File Read: {time.perf_counter() - start:.4f}s")
+    
     # ── Step 1: Rule-based parsing (UNCHANGED — parser is truth) ────────────
+    start = time.perf_counter()
     entry_info = find_entry_point(text)
     extracted  = extract_all(text)
+    print(f"[TIME] Parser (Rule-Based): {time.perf_counter() - start:.4f}s")
     
-    # ── Step 1.5: Hybrid AI Assist strictly for gap-filling ─────────────────
-    from ai_assist_parser import run_hybrid_pipeline
-    extracted = run_hybrid_pipeline(text, extracted)
+    # ── Override Metadata Lie with Empirical RAT Detection ──────────────────
+    empirical_rat = detect_rat_type(extracted)
+    entry_info["rat_type"] = empirical_rat
     
+    print(f"[DEBUG] Empirically Detected RAT: {empirical_rat}")
+    print(f"[DEBUG] NR bands: {len(extracted.get('nrBands', []))}")
+    print(f"[DEBUG] NR CA combos: {len(extracted.get('nrca', []))}")
+    print(f"[DEBUG] MRDC combos: {len(extracted.get('mrdc', []))}")
+    
+    # ── Step 1.5: AI Stage 1 - GAP-FILL ─────────────────────────────────────
+    from ai_processor import fill_gaps_ai, enrich_output, validate_output_ai
+    
+    start = time.perf_counter()
+    rat_type = entry_info.get("rat_type", "unknown")
+    extracted = fill_gaps_ai(extracted, rat_type)
+    print(f"[TIME] AI Stage 1 (Gap-Fill): {time.perf_counter() - start:.4f}s")
+    
+    # ── Step 2: Format & Basic Confidence ───────────────────────────────────
+    start = time.perf_counter()
     result     = format_output(extracted, entry_info, file.filename)
     validation = score_output(result)
     result["validation"] = validation
+    print(f"[TIME] Format & Confidence: {time.perf_counter() - start:.4f}s")
 
-    # Step 2 logic has been integrated inside run_hybrid_pipeline.
+    # ── Step 3: AI Stage 2 & 3 - ENRICHMENT & VALIDATION ────────────────────
+    start = time.perf_counter()
+    rat_type = entry_info.get("rat_type", "unknown")
+    result = enrich_output(result, rat_type)
+    result = validate_output_ai(result, rat_type)
+    print(f"[TIME] AI Stage 2&3 (Enrich+Validate): {time.perf_counter() - start:.4f}s")
 
-    # ── Step 3: Flatten combos and store ────────────────────────────────────
+    # ── Step 4: Flatten combos and store ────────────────────────────────────
     combos = _flatten_combos(result)
 
     _store["result"]       = result
@@ -244,7 +284,8 @@ async def upload(file: UploadFile = File(...)):
     # If AI computed a hybrid severity confidence, use it over the naive score
     hybrid_confidence = ai_notes.get("confidence", validation.get("score"))
 
-    return {
+    # JSON Serialization length check
+    out_payload = {
         "status":   "success",
         "filename": file.filename,
         "rat_type": entry_info.get("rat_type"),
@@ -266,6 +307,17 @@ async def upload(file: UploadFile = File(...)):
         "ai_summary":        ai_enrich.get("summary"),
         "ai_anomalies":      ai_enrich.get("issues", []),
     }
+    
+    import json
+    start = time.perf_counter()
+    response_size = len(json.dumps(out_payload))
+    print(f"[TIME] JSON Serialization: {time.perf_counter() - start:.4f}s")
+    print(f"[DEBUG] Response size: {response_size} bytes")
+    
+    from ai_processor import ai_call_count
+    print(f"\n[AI] Total calls: {ai_call_count}")
+    print(f"[TOTAL] Request time: {time.perf_counter() - start_total:.4f}s\n")
+    return out_payload
 
 
 @app.get("/combinations")

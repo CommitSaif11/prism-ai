@@ -1,270 +1,102 @@
 """
-sequential_extractor.py  v3.0
-==============================
-Step 2 — Extract ALL parameters Samsung requires.
+sequential_extractor.py  v5.0  — FINAL
+========================================
+Key fix in v5: channelBWs-DL bitmask extraction uses REGEX on raw text,
+NOT the parsed tree. This bypasses the tokenizer bug where spaces inside
+bit strings ('00010111 11'B) cause the parser to split the value incorrectly.
 
-ROOT CAUSE FIXES (verified against actual parser output):
-  1. Parser treats trailing commas as WORD tokens.
-     "},\n{" produces key "," with values being subsequent combo entries.
-     _blocks() now collects items from BOTH _block_N keys AND "," keys.
-
-  2. ",_nr" — inside bandList, the nr block's key is ",_nr" (because a comma
-     precedes "nr { ... }"). Lookups must check BOTH "eutra"/",_eutra" and "nr"/",_nr".
-
-  3. All values may have trailing commas: "3," → 3. _clean_str() strips them.
-
-  4. featureSetCombination stored as: "," : "featureSetCombination", then index stored
-     separately as "1" : True.  Need _extract_fsc_id() to handle this pattern.
+All other key paths verified from real log inspection.
 """
 
 from __future__ import annotations
 import re, sys, os
 from typing import Any, Dict, List, Optional
 
-sys.path.insert(0, os.path.dirname(__file__))
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from asn_parser import parse_text, _norm
 
+# ─── Helpers ─────────────────────────────────────────────────────────────────
 
-# ─── Core helpers ─────────────────────────────────────────────────────────────
-
-def _to_int(s) -> Optional[int]:
+def _nk(k): return re.sub(r'[^a-z0-9]', '', str(k).lower())
+def _to_int(s):
     if s is None: return None
-    try: return int(re.sub(r'[^0-9-]', '', str(s).strip()))
+    try: return int(re.sub(r'[^0-9-]', '', str(s).strip().rstrip(',')))
     except: return None
-
-def _to_bool(s) -> Optional[bool]:
+def _to_bool(s):
     if isinstance(s, bool): return s
-    s = str(s).lower().strip().rstrip(',')
-    if s in ('true', 'yes', '1', 'supported'): return True
-    if s in ('false', 'no', '0', 'notsupported', 'not_supported'): return False
+    v = str(s).lower().strip().rstrip(',')
+    if v in ('true','yes','1','supported'): return True
+    if v in ('false','no','0','notsupported'): return False
     return None
-
-def _norm_key(k: str) -> str:
-    return re.sub(r'[^a-z0-9]', '', str(k).lower())
-
-def _clean_str(v) -> str:
-    """Strip whitespace AND trailing commas. Fixes 'A,' → 'A', '3,' → '3'."""
-    if v is None: return ''
-    return str(v).strip().rstrip(',').strip()
-
-def _sv(val) -> Optional[dict]:
-    if val is None: return None
-    return {"type": "single", "value": val}
-
-def _mimo_to_int(s) -> Optional[int]:
+def _clean(v): return str(v).strip().rstrip(',').strip() if v is not None else ''
+def _sv(val): return {"type":"single","value":val} if val is not None else None
+def _mimo_to_int(s):
     if not s: return None
-    v = _clean_str(str(s))
+    v = _clean(str(s))
     if v.isdigit(): return int(v)
-    c = re.sub(r'[^a-z]', '', v.lower())
-    return {'onelayer':1,'one':1,'twolayers':2,'two':2,
-            'fourlayers':4,'four':4,'eightlayers':8,'eight':8}.get(c)
-
-def _parse_bw(s) -> Optional[int]:
+    c = _nk(v)
+    return {'onelayer':1,'twolayers':2,'fourlayers':4,'eightlayers':8,
+            'one':1,'two':2,'four':4,'eight':8}.get(c)
+def _parse_bw_mhz(s):
     if not s: return None
     m = re.search(r'mhz(\d+)', str(s), re.I)
     if m: return int(m.group(1))
-    m = re.match(r'^\s*(\d+)\s*$', _clean_str(str(s)))
+    m = re.match(r'^\s*(\d+)\s*$', _clean(str(s)))
     if m: return int(m.group(1))
     return None
 
-
-# ─── Tree navigation (parser-aware) ──────────────────────────────────────────
+# ─── Tree navigation ──────────────────────────────────────────────────────────
 
 def _blocks(node) -> list:
-    """
-    CRITICAL FIX: Extract ALL child entries from a container node.
-
-    The parser stores them in two ways:
-      - _block_0, _block_1, ...  (anonymous blocks: `{ ... }`)
-      - ","                       (entries after a comma: `}, { ... }`)
-
-    Both must be collected to get ALL entries.
-    """
     if node is None: return []
-    if isinstance(node, list): return node
+    if isinstance(node, list): return [x for x in node if isinstance(x, dict)]
     if isinstance(node, dict):
-        entries = []
-        # 1. Collect _block_N entries (sorted by number)
-        bkeys = sorted(
-            [k for k in node if k.startswith('_block_')],
-            key=lambda k: int(k.split('_')[2]) if k.split('_')[2].isdigit() else 0
-        )
-        for k in bkeys:
-            v = node[k]
-            if isinstance(v, dict):
-                entries.append(v)
-            elif isinstance(v, list):
-                entries.extend(x for x in v if isinstance(x, dict))
-
-        # 2. Collect comma-separated entries (key is literally ",")
-        comma_val = node.get(',')
-        if comma_val is not None:
-            if isinstance(comma_val, dict):
-                entries.append(comma_val)
-            elif isinstance(comma_val, list):
-                entries.extend(x for x in comma_val if isinstance(x, dict))
-
-        if entries:
-            return entries
-
-        # 3. Fallback: single-value dict wrapping a list
+        bkeys = sorted([k for k in node if k.startswith('_block_')],
+                       key=lambda k: int(k.split('_')[2]) if k.split('_')[2].isdigit() else 0)
+        if bkeys:
+            result = []
+            for k in bkeys:
+                v = node[k]
+                if isinstance(v, dict): result.append(v)
+                elif isinstance(v, list): result.extend(x for x in v if isinstance(x, dict))
+            return result
         vals = list(node.values())
         if len(vals) == 1 and isinstance(vals[0], list):
-            return vals[0]
-
-        # 4. Last resort: the dict itself is the entry
+            return [x for x in vals[0] if isinstance(x, dict)]
         return [node]
     return []
 
-
-def _get_val(d: dict, *raw_keys) -> Any:
-    """
-    Look up a value in dict, trying:
-      1. Exact key
-      2. Parser-normalized key (_norm)
-      3. Comma-prefixed key (",_<key>") — parser artifact from trailing commas
-      4. _norm_key match (strips all separators)
-
-    This handles all parser output variants.
-    """
+def _get(d, *keys):
     if not isinstance(d, dict): return None
-    for rk in raw_keys:
-        # exact
-        if rk in d: return d[rk]
-        # parser-normed
-        normed = _norm(rk)
-        if normed in d: return d[normed]
-        # comma-prefixed (parser artifact)
-        comma_key = f",_{normed}"
-        if comma_key in d: return d[comma_key]
-        comma_key2 = f",_{rk.lower()}"
-        if comma_key2 in d: return d[comma_key2]
-
-    # full _norm_key sweep (strip everything)
-    target_set = {_norm_key(k) for k in raw_keys}
-    for k, v in d.items():
-        if _norm_key(k) in target_set:
-            return v
+    for rk in keys:
+        target = _nk(rk)
+        for k, v in d.items():
+            if _nk(k) == target: return v
     return None
 
-
-def _find(tree, keys):
-    """DFS — collect all values at matching keys."""
+def _find_all(tree, *keys) -> list:
     result = []
-    keys_norm = {_norm_key(k) for k in keys}
+    targets = {_nk(k) for k in keys}
     def _walk(node):
         if isinstance(node, dict):
             for k, v in node.items():
-                nk = _norm_key(k)
-                if nk in keys_norm:
+                if _nk(k) in targets:
                     if isinstance(v, list): result.extend(v)
                     else: result.append(v)
-                _walk(v)  # ALWAYS recurse (even into matched values)
-        elif isinstance(node, list):
-            for item in node: _walk(item)
-    _walk(tree)
-    return result
-
-
-def _collect(tree, keys):
-    """Recursive collect — returns {norm_key: [all_values]} from entire subtree."""
-    r = {}
-    keys_norm = {_norm_key(k) for k in keys}
-    def _walk(node):
-        if isinstance(node, dict):
-            for k, v in node.items():
-                nk = _norm_key(k)
-                if nk in keys_norm:
-                    r.setdefault(nk, [])
-                    if isinstance(v, list): r[nk].extend(v)
-                    else: r[nk].append(v)
-                _walk(v)
-        elif isinstance(node, list):
-            for item in node: _walk(item)
-    _walk(tree)
-    return r
-
-
-def _first(collected, *keys):
-    for k in keys:
-        vals = collected.get(_norm_key(k))
-        if vals: return vals[0]
-    return None
-
-
-def _find_entries_with(tree, key_names):
-    """Find ALL dicts in the tree that contain at least one of the given keys."""
-    result = []
-    keys_norm = {_norm_key(k) for k in key_names}
-    def _walk(node):
-        if isinstance(node, dict):
-            has = any(_norm_key(k) in keys_norm for k in node.keys())
-            if has:
-                result.append(node)
-            for v in node.values():
                 _walk(v)
         elif isinstance(node, list):
             for item in node: _walk(item)
     _walk(tree)
     return result
 
-
-def _all_child_dicts(node) -> list:
-    """
-    Get ALL dict children from a node — handles named keys, lists,
-    _block_N keys, AND comma-prefixed keys.
-    """
-    if isinstance(node, list):
-        return [x for x in node if isinstance(x, dict)]
-    if isinstance(node, dict):
-        result = []
-        for k, v in node.items():
-            if k == '__type__': continue
-            if isinstance(v, dict):
-                result.append(v)
-            elif isinstance(v, list):
-                result.extend(x for x in v if isinstance(x, dict))
-        return result
-    return []
-
-
-def _extract_fsc_id(entry: dict) -> Optional[int]:
-    """
-    Extract featureSetCombination ID from an entry.
-    Parser stores this weirdly:
-      "," : "featureSetCombination"   (comma key stores the name)
-      "1" : True                     (the actual ID is stored as a key)
-
-    OR sometimes:
-      "featuresetcombination" : "1"
-    """
-    # Direct key
-    for k, v in entry.items():
-        if _norm_key(k) == 'featuresetcombination':
-            i = _to_int(v)
-            if i is not None: return i
-
-    # Parser-artifact pattern: comma stores name, next key is the ID
-    comma_val = entry.get(',')
-    if isinstance(comma_val, str) and _norm_key(comma_val) == 'featuresetcombination':
-        # Look for the numeric key that follows
-        for k in entry.keys():
-            clean_k = _clean_str(k)
-            if clean_k.isdigit():
-                return int(clean_k)
-
-    return None
-
-
-def _unwrap(raw: str) -> dict:
+def _unwrap(raw):
     parsed = parse_text(raw)
     eq = parsed.get('=')
     if isinstance(eq, list) and eq and isinstance(eq[0], dict): return eq[0]
     if isinstance(eq, dict): return eq
     return parsed
 
-
-# ─── Section boundaries ──────────────────────────────────────────────────────
+# ─── Section splitter ─────────────────────────────────────────────────────────
 
 _SEC_PAT = {
     'mrdc':  re.compile(r'value\s+UE-MRDC-Capability(?:-v\w+)?\s*::=', re.IGNORECASE),
@@ -272,13 +104,12 @@ _SEC_PAT = {
     'nr':    re.compile(r'value\s+UE-NR-Capability(?:-v\w+)?\s*::=', re.IGNORECASE),
 }
 
-def _split_sections(text: str) -> dict:
+def _split_sections(text):
     lines = text.splitlines(keepends=True)
     hits = {}
     for i, line in enumerate(lines):
         for name, pat in _SEC_PAT.items():
-            if pat.search(line) and name not in hits:
-                hits[name] = i
+            if pat.search(line) and name not in hits: hits[name] = i
     if not hits: return {}
     ordered = sorted(hits.items(), key=lambda x: x[1])
     result = {}
@@ -287,534 +118,512 @@ def _split_sections(text: str) -> dict:
         result[name] = ''.join(lines[start:end])
     return result
 
-
-# ─── LTE Band extraction ──────────────────────────────────────────────────────
-
-def _extract_lte_bands(eutra_tree: dict) -> list:
-    bands = []
-    seen = set()
-
-    # Find all dicts that contain bandeutra — these are band entries
-    entries = _find_entries_with(eutra_tree, {'bandEUTRA', 'bandeutra', 'band_eutra'})
-
-    # Filter: only entries from supportedBandListEUTRA context (not CA combos)
-    # We use _find to get the container, then _blocks + _all_child_dicts
-    containers = _find(eutra_tree, {
-        'supportedbandlisteutra', 'supported_band_list_eutra',
-    })
-
-    band_entries = []
-    for container in containers:
-        for entry in _blocks(container):
-            if isinstance(entry, dict):
-                band_entries.append(entry)
-
-    # If structured search found entries, use those. Otherwise fall back to DFS.
-    if not band_entries:
-        band_entries = entries
-
-    for entry in band_entries:
-        if not isinstance(entry, dict): continue
-        c = _collect(entry, {
-            'bandEUTRA', 'bandEUTRA_r10', 'bandeutra',
-            'halfDuplex', 'half_duplex',
-            'maxNumberMIMO-LayersDL', 'maxnumbermimolayersdl',
-            'supportedMIMO-CapabilityDL-r10', 'supportedmimocapabilitydlr10',
-            'dl-256QAM-r12', 'dl_256qam_r12',
-            'ul-64QAM-r12', 'ul_64qam_r12',
-            'powerClass', 'power_class',
-        })
-
-        bn = _to_int(_first(c, 'bandeutra', 'bandeutra_r10'))
-        if bn is None or bn in seen: continue
-        seen.add(bn)
-
-        mimo = _mimo_to_int(_first(c, 'supportedmimocapabilitydlr10', 'maxnumbermimolayersdl'))
-        dl256 = _to_bool(str(_first(c, 'dl256qamr12') or ''))
-        ul64 = _to_bool(str(_first(c, 'ul64qamr12') or ''))
-        hd = _to_bool(str(_first(c, 'halfduplex') or ''))
-
-        bands.append({
-            "band": bn,
-            "mimoDl": _sv(mimo) if mimo else None,
-            "mimoUl": None,
-            "modulationDl": _sv("qam256") if dl256 else None,
-            "modulationUl": _sv("qam64") if ul64 else None,
-            "powerClass": _clean_str(_first(c, 'powerclass') or '') or None,
-            "extras": {
-                "bandEUTRA": bn,
-                "halfDuplex": hd if hd is not None else False,
-            }
-        })
-
-    return bands
-
-
-# ─── NR Band extraction ──────────────────────────────────────────────────────
+# ─── BW bitmask tables ────────────────────────────────────────────────────────
 
 _BW_TABLES = {
-    15:  [5,10,15,20,25,30,40,50],
-    30:  [5,10,15,20,25,40,50,60,80,100],
-    60:  [10,15,20,25,40,50,60,80,100],
-    120: [50,100,200,400],
+    15:  [5, 10, 15, 20, 25, 30, 40, 50],
+    30:  [5, 10, 15, 20, 25, 40, 50, 60, 80, 100],
+    60:  [10, 15, 20, 25, 40, 50, 60, 80, 100],
+    120: [50, 100, 200, 400],
     240: [400],
 }
 
-def _parse_bitmask(bitmask_str: str, scs: int) -> list:
-    clean = re.sub(r'[^01]', '', str(bitmask_str))
+def _decode_bitmask(bits_str, scs):
+    clean = re.sub(r'[^01]', '', str(bits_str))
     table = _BW_TABLES.get(scs, [])
     return [table[i] for i, bit in enumerate(clean) if bit == '1' and i < len(table)]
 
+# ─── CRITICAL: Raw-text BW extraction ────────────────────────────────────────
+# Bypasses the parser entirely for channelBWs bitmasks.
+# Reason: the parser tokenizer splits '00010111 11'B on the space,
+#         producing broken key fragments. Regex on raw text is reliable.
 
-def _extract_nr_bands(nr_tree: dict) -> list:
-    bands = []
-    seen = set()
-
-    # Find supportedBandListNR containers
-    containers = _find(nr_tree, {
-        'supportedbandlistnr', 'supported_band_list_nr',
-    })
-
-    band_entries = []
-    for container in containers:
-        for entry in _blocks(container):
-            if isinstance(entry, dict):
-                band_entries.append(entry)
-
-    # Fallback: DFS for ALL dicts containing bandNR
-    if not band_entries:
-        band_entries = _find_entries_with(nr_tree, {'bandNR', 'bandnr', 'band_nr'})
-
-    for entry in band_entries:
-        if not isinstance(entry, dict): continue
-        c = _collect(entry, {
-            'bandNR', 'band_nr', 'bandnr',
-            'maxNumberMIMO-LayersPDSCH', 'maxnumbermimolayerspdsch',
-            'maxNumberMIMO-LayersCB-PUSCH', 'maxnumbermimolayerscbpusch',
-            'modulationOrderDL', 'modulationorderdl',
-            'modulationOrderUL', 'modulationorderul',
-            'pusch-256QAM', 'pusch256qam',
-            'ue-PowerClass', 'uepowerclass',
-            'multipleTCI', 'multipletci',
-            'rateMatchingLTE-CRS', 'ratematchingltecrs',
-        })
-
-        bn = _to_int(_first(c, 'bandnr', 'band_nr'))
-        if bn is None or bn in seen: continue
-        seen.add(bn)
-
-        mimo_dl = _mimo_to_int(_first(c, 'maxnumbermimolayerspdsch'))
-        mimo_ul = _mimo_to_int(_first(c, 'maxnumbermimolayerscbpusch'))
-        mod_dl = _clean_str(_first(c, 'modulationorderdl') or '') or None
-        mod_ul = _clean_str(_first(c, 'modulationorderul') or '') or None
-        pc = _clean_str(_first(c, 'uepowerclass') or '') or None
-
-        # Parse channelBWs bitmasks
-        bws = []
-        def _walk_bws(node):
-            if isinstance(node, dict):
-                for k, v in node.items():
-                    nk = _norm_key(k)
-                    if 'channelbw' in nk and 'dl' in nk and 'ul' not in nk:
-                        if isinstance(v, dict):
-                            for scs_k, bitmask in v.items():
-                                d = re.search(r'(\d+)', scs_k)
-                                if d:
-                                    scs_val = int(d.group(1))
-                                    bw_list = _parse_bitmask(str(bitmask), scs_val)
-                                    if bw_list:
-                                        bws.append({"scs": scs_val, "bandwidthsDl": bw_list, "bandwidthsUl": bw_list})
-                    _walk_bws(v)
-            elif isinstance(node, list):
-                for item in node: _walk_bws(item)
-        _walk_bws(entry)
-
-        bands.append({
-            "band": bn,
-            "mimoDl": _sv(mimo_dl) if mimo_dl else None,
-            "mimoUl": _sv(mimo_ul) if mimo_ul else None,
-            "modulationDl": _sv(mod_dl) if mod_dl else None,
-            "modulationUl": _sv(mod_ul) if mod_ul else None,
-            "powerClass": pc,
-            "bandwidths": bws,
-            "rateMatchingLteCrs": _to_bool(str(_first(c, 'ratematchingltecrs') or '')),
-            "extras": {"bandNR": bn}
-        })
-
-    return bands
-
-
-# ─── Classify bandList components ─────────────────────────────────────────────
-
-def _classify_band_components(bl_dict: dict) -> tuple:
+def _extract_bws_from_raw(raw_nr_text, band_num) -> List[dict]:
     """
-    Given a bandList dict, return (lte_components, nr_components).
-
-    PARSER REALITY: Inside bandList, the parser stores:
-      "eutra": { bandeutra: "3,", ... }               ← first eutra entry
-      ",_eutra": { bandeutra: "7,", ... }              ← second eutra (after comma)
-      ",_nr": { bandnr: "78,", ... }                   ← nr entries (after comma)
-      ",_nr": [{ bandnr: "78," }, { bandnr: "257," }]  ← if multiple NR entries
-
-    So we must check ALL keys, not just "eutra" and "nr".
-    Strategy: collect ALL child dicts, then classify by content.
+    Extract channelBWs-DL for one NR band from raw NR section text.
+    Handles spaces inside bit strings correctly.
     """
-    lte_comps = []
-    nr_comps = []
+    m = re.search(rf'bandNR\s+{band_num}\b', raw_nr_text, re.IGNORECASE)
+    if not m: return []
 
-    if not isinstance(bl_dict, dict):
-        return (lte_comps, nr_comps)
+    rest = raw_nr_text[m.start():]
+    next_band = re.search(r'bandNR\s+\d+\b', rest[10:], re.IGNORECASE)
+    chunk = rest[:next_band.start()+10] if next_band else rest[:6000]
 
-    # Collect ALL dict children from bandList (handles all key patterns)
-    all_children = _all_child_dicts(bl_dict)
+    # Match: channelBWs-DL fr1 : { scs-30kHz '...'B, ... }
+    bw_pattern = r'channelBWs-DL\s+\w+\s*:\s*\{([^}]+)\}'
+    bw_match   = re.search(bw_pattern, chunk, re.IGNORECASE | re.DOTALL)
+    if not bw_match: return []
 
-    for child in all_children:
-        if not isinstance(child, dict):
-            continue
+    bw_block = bw_match.group(1)
+    bws = []
 
-        # Classify: does it have bandEUTRA or bandNR?
-        c = _collect(child, {
-            'bandEUTRA', 'bandeutra', 'band_eutra', 'bandeutra_r10',
-            'bandNR', 'bandnr', 'band_nr',
-            'ca-BandwidthClassDL', 'ca_bandwidthclassdl', 'cabandwidthclassdl',
-            'ca-BandwidthClassDL-r10', 'ca_bandwidth_class_dl_r10', 'cabandwidthclassdlr10',
-            'ca-BandwidthClassUL', 'ca_bandwidthclassul', 'cabandwidthclassul',
-            'ca-BandwidthClassUL-r10', 'ca_bandwidth_class_ul_r10', 'cabandwidthclassulr10',
-        })
+    # scs-30kHz '00010111 11'B  (note: space inside the bit string is valid)
+    scs_pat = r"scs[-_](\d+)kHz\s+'([01][01\s]*)'\s*[Bb]"
+    for scs_m in re.finditer(scs_pat, bw_block, re.IGNORECASE):
+        scs_val = int(scs_m.group(1))
+        decoded = _decode_bitmask(scs_m.group(2), scs_val)
+        if decoded:
+            bws.append({"scs": scs_val, "bandwidthsDl": decoded, "bandwidthsUl": decoded})
 
-        bn_lte = _to_int(_first(c, 'bandeutra', 'bandeutra_r10'))
-        bn_nr = _to_int(_first(c, 'bandnr', 'band_nr'))
+    return bws
 
-        bw_dl = _clean_str(_first(c, 'cabandwidthclassdl', 'cabandwidthclassdlr10') or '').upper() or None
-        bw_ul = _clean_str(_first(c, 'cabandwidthclassul', 'cabandwidthclassulr10') or '').upper() or None
+def _build_band_bw_map(raw_nr_text, band_nums) -> dict:
+    """Build {band_num: [bw_entries]} for all NR bands using raw text."""
+    return {bn: _extract_bws_from_raw(raw_nr_text, bn) for bn in band_nums}
 
-        if bn_lte is not None:
-            lte_comps.append({
-                "band": bn_lte,
-                "bwClassDl": bw_dl,
-                "bwClassUl": bw_ul,
-                "mimoDl": _sv(2),
-                "mimoUl": _sv(1),
-                "modulationDl": _sv("qam256"),
-                "modulationUl": _sv("qam64"),
-            })
-        elif bn_nr is not None:
-            nr_comps.append({
-                "band": bn_nr,
-                "bwClassDl": bw_dl,
-                "bwClassUl": bw_ul,
-                "mimoDl": None,
-                "mimoUl": _sv(1),
-                "modulationDl": None,
-                "modulationUl": _sv("qam256"),
-                "maxScs": None,
-                "maxBwDl": None,
-                "maxBwUl": None,
-            })
+# ─── featureSet tables ────────────────────────────────────────────────────────
 
-    return (lte_comps, nr_comps)
-
-
-# ─── LTE CA extraction ────────────────────────────────────────────────────────
-
-def _extract_lte_ca(eutra_tree: dict) -> list:
-    combos = []
-    containers = _find(eutra_tree, {
-        'supportedbandcombination_r10', 'supportedbandcombinationr10',
-        'supportedbandcombinationlist',
-    })
-
-    for container in containers:
-        for combo_block in _blocks(container):
-            if not isinstance(combo_block, dict): continue
-
-            components = []
-            # Each inner block is a component carrier
-            for cc_block in _blocks(combo_block):
-                if not isinstance(cc_block, dict): continue
-                c = _collect(cc_block, {
-                    'bandEUTRA', 'bandeutra', 'bandeutra_r10',
-                    'ca-BandwidthClassDL-r10', 'cabandwidthclassdlr10',
-                    'ca-BandwidthClassUL-r10', 'cabandwidthclassulr10',
-                    'supportedMIMO-CapabilityDL-r10', 'supportedmimocapabilitydlr10',
-                })
-                bn = _to_int(_first(c, 'bandeutra', 'bandeutra_r10'))
-                if bn is None: continue
-
-                bw_dl = _clean_str(_first(c, 'cabandwidthclassdlr10') or '').upper() or None
-                bw_ul = _clean_str(_first(c, 'cabandwidthclassulr10') or '').upper() or None
-                mimo = _mimo_to_int(_first(c, 'supportedmimocapabilitydlr10'))
-
-                components.append({
-                    "band": bn,
-                    "bwClassDl": bw_dl,
-                    "bwClassUl": bw_ul,
-                    "mimoDl": _sv(mimo) if mimo else None,
-                    "mimoUl": _sv(1),
-                    "modulationDl": _sv("qam256"),
-                    "modulationUl": _sv("qam64"),
-                })
-
-            # If inner blocks didn't yield CCs, try the block itself
-            if not components:
-                c = _collect(combo_block, {
-                    'bandeutra', 'bandeutra_r10',
-                    'cabandwidthclassdlr10', 'cabandwidthclassulr10',
-                    'supportedmimocapabilitydlr10',
-                })
-                bn = _to_int(_first(c, 'bandeutra', 'bandeutra_r10'))
-                if bn is not None:
-                    components.append({
-                        "band": bn,
-                        "bwClassDl": _clean_str(_first(c, 'cabandwidthclassdlr10') or '').upper() or None,
-                        "bwClassUl": _clean_str(_first(c, 'cabandwidthclassulr10') or '').upper() or None,
-                        "mimoDl": _sv(_mimo_to_int(_first(c, 'supportedmimocapabilitydlr10'))),
-                        "mimoUl": _sv(1),
-                        "modulationDl": _sv("qam256"),
-                        "modulationUl": _sv("qam64"),
-                    })
-
-            if components:
-                combos.append({"components": components, "bcs": _sv(0)})
-
-    return combos
-
-
-# ─── NR CA extraction ─────────────────────────────────────────────────────────
-
-def _extract_nr_ca(nr_tree: dict, fsc_list: list, fs_tables: dict) -> list:
-    combos = []
-    containers = _find(nr_tree, {
-        'supportedbandcombinationlist', 'supported_band_combination_list',
-    })
-
-    for container in containers:
-        for entry in _blocks(container):
-            if not isinstance(entry, dict): continue
-
-            fsc_id = _extract_fsc_id(entry)
-
-            # Get bandList, classify components
-            bl = _get_val(entry, 'bandList', 'band_list', 'bandlist')
-            if bl is None: continue
-
-            # For NR CA, all components should be NR
-            _, nr_components = _classify_band_components(bl)
-
-            # Also check for LTE components (some NR CA combos have them)
-            lte_components, _ = _classify_band_components(bl)
-
-            # If we have direct NR entries (not via eutra/nr split), collect them
-            if not nr_components:
-                # bandList might directly contain bandNR entries
-                for child in _all_child_dicts(bl):
-                    c = _collect(child, {'bandNR', 'bandnr'})
-                    bn = _to_int(_first(c, 'bandnr'))
-                    if bn is not None:
-                        nr_components.append({
-                            "band": bn,
-                            "bwClassDl": None,
-                            "bwClassUl": None,
-                            "mimoDl": None,
-                            "mimoUl": _sv(1),
-                            "modulationDl": None,
-                            "modulationUl": _sv("qam256"),
-                            "maxScs": None,
-                            "maxBwDl": None,
-                            "maxBwUl": None,
-                        })
-
-            if nr_components:
-                band_list_str = ",".join(str(c["band"]) for c in nr_components)
-                combos.append({
-                    "components": nr_components,
-                    "bcs": _sv(0),
-                    "customData": [{"bandList": band_list_str, "featureSetCombination": fsc_id}]
-                })
-
-    return combos
-
-
-# ─── MRDC extraction ──────────────────────────────────────────────────────────
-
-def _extract_mrdc(mrdc_tree: dict, nr_fsc_list: list, fs_tables: dict) -> list:
-    """
-    Extract ALL MRDC/EN-DC band combinations.
-
-    Uses _blocks() which now correctly collects entries from both
-    _block_N keys AND comma-separated keys.
-    """
-    combos = []
-
-    # Find ALL supportedBandCombinationList containers in the tree
-    containers = _find(mrdc_tree, {
-        'supportedbandcombinationlist', 'supported_band_combination_list',
-    })
-
-    print(f"[EXTRACT] MRDC containers found: {len(containers)}", file=sys.stderr)
-
-    total_entries = 0
-
-    for container in containers:
-        entries = _blocks(container)
-        print(f"[EXTRACT] Container entries: {len(entries)}", file=sys.stderr)
-        total_entries += len(entries)
-
-        for entry in entries:
-            if not isinstance(entry, dict):
-                continue
-
-            fsc_id = _extract_fsc_id(entry)
-
-            # Get bandList
-            bl = _get_val(entry, 'bandList', 'band_list', 'bandlist')
-            if bl is None:
-                continue
-
-            # Classify all children of bandList into LTE and NR components
-            lte_comps, nr_comps = _classify_band_components(bl)
-
-            if not lte_comps and not nr_comps:
-                continue
-
-            # Collect MRDC-specific parameters from entry
-            dps = None
-            srxt = None
-            for k, v in entry.items():
-                nk = _norm_key(k)
-                if 'dynamicpowersharingendc' in nk:
-                    dps = _clean_str(v)
-                elif 'simultaneousrxtxinterbandendc' in nk:
-                    srxt = _clean_str(v)
-
-            lte_bands_str = ",".join(str(c["band"]) for c in lte_comps)
-            nr_bands_str = ",".join(str(c["band"]) for c in nr_comps)
-            band_list_str = f"{lte_bands_str},{nr_bands_str}".strip(',')
-
-            combos.append({
-                "componentsLte": lte_comps,
-                "componentsNr": nr_comps,
-                "bcsNr": _sv(0),
-                "bcsEutra": _sv(0),
-                "customData": [{
-                    "bandList": band_list_str,
-                    "featureSetCombination": fsc_id,
-                    "dynamicPowerSharingENDC": dps,
-                    "simultaneousRxTxInterBandENDC": srxt,
-                }]
-            })
-
-    print(f"[EXTRACT] MRDC total entries scanned: {total_entries}", file=sys.stderr)
-    print(f"[EXTRACT] MRDC combos extracted: {len(combos)}", file=sys.stderr)
-
-    return combos
-
-
-# ─── FeatureSet resolution ───────────────────────────────────────────────────
-
-def _resolve_caps(fsc_id: int, fsc_list: list, tables: dict) -> dict:
-    if not fsc_id or fsc_id < 1 or fsc_id > len(fsc_list):
-        return {}
-    fsc_entry = fsc_list[fsc_id - 1]
-    dl_ids = []
-    def _walk(node):
-        if isinstance(node, dict):
-            for k, v in node.items():
-                if _norm_key(k) == 'downlinksetnr':
-                    i = _to_int(v)
-                    if i: dl_ids.append(i)
-                else: _walk(v)
-        elif isinstance(node, list):
-            for item in node: _walk(item)
-    _walk(fsc_entry)
-    dl_list = tables.get('dl_list', [])
-    per_cc = tables.get('dl_per_cc', [])
-    best = {}
-    for dl_id in dl_ids:
-        if dl_id < 1 or dl_id > len(dl_list): continue
-        fs_dl = dl_list[dl_id - 1]
-        if not isinstance(fs_dl, dict): continue
-        for k, v in fs_dl.items():
-            nk = _norm_key(k)
-            val = _clean_str(v) if isinstance(v, str) else ''
-            if 'mimolayers' in nk and 'ul' not in nk:
-                m = _mimo_to_int(val)
-                if m and m > best.get('mimo', 0):
-                    best['mimo'] = m
-            elif 'modulationorderdl' in nk:
-                best['mod'] = val.lower()
-    return best
-
-
-def _extract_fs_tables(nr_tree: dict) -> dict:
+def _build_fs_tables(nr_tree):
     tables = {'dl_list': [], 'dl_per_cc': [], 'ul_list': [], 'ul_per_cc': []}
-    fs = _get_val(nr_tree, 'featureSets', 'feature_sets', 'featuresets')
+    fs = _get(nr_tree, 'featureSets', 'featuresets')
     if not fs or not isinstance(fs, dict): return tables
 
     def _ordered(node):
         if isinstance(node, list): return [e for e in node if isinstance(e, dict)]
         if isinstance(node, dict):
-            entries = []
-            for k, v in sorted(node.items()):
-                if k.startswith('_block_') and isinstance(v, dict):
-                    entries.append(v)
-            if entries: return entries
-            return _blocks(node)
+            bkeys = [(k, v) for k, v in node.items() if re.match(r'_block_\d+$', k)]
+            if bkeys:
+                return [v for _, v in sorted(bkeys, key=lambda x: int(x[0].split('_')[2]))]
+            return [node]
         return []
 
     for k, v in fs.items():
-        nk = _norm_key(k)
-        if nk == 'featuresetsdownlink': tables['dl_list'] = _ordered(v)
-        elif nk == 'featuresetsdownlinkpercc': tables['dl_per_cc'] = _ordered(v)
-        elif nk == 'featuresetsuplink': tables['ul_list'] = _ordered(v)
-        elif nk == 'featuresetsuplinkpercc': tables['ul_per_cc'] = _ordered(v)
-
+        nk = _nk(k)
+        if   nk == 'featuresetsdownlink':        tables['dl_list']   = _ordered(v)
+        elif nk == 'featuresetsdownlinkpercc':   tables['dl_per_cc'] = _ordered(v)
+        elif nk == 'featuresetsuplink':          tables['ul_list']   = _ordered(v)
+        elif nk == 'featuresetsuplinkpercc':     tables['ul_per_cc'] = _ordered(v)
     return tables
 
+def _resolve_percc(dl_id, dl_list, percc_list):
+    if dl_id < 1 or dl_id > len(dl_list): return {}
+    dl_entry = dl_list[dl_id - 1]
+    if not isinstance(dl_entry, dict): return {}
 
-# ─── Main extraction function ────────────────────────────────────────────────
+    per_cc_id = None
+    for k, v in dl_entry.items():
+        if 'featuresetlistperdownlinkcc' in _nk(k):
+            if isinstance(v, dict):
+                first_key = next(iter(v.keys()), None)
+                try: per_cc_id = int(_clean(first_key)) if first_key else None
+                except: per_cc_id = None
+            else:
+                try: per_cc_id = int(_clean(str(v)))
+                except: per_cc_id = None
+            break
+
+    if not per_cc_id or per_cc_id < 1 or per_cc_id > len(percc_list): return {}
+    percc = percc_list[per_cc_id - 1]
+    if not isinstance(percc, dict): return {}
+
+    result = {}
+    for k, v in percc.items():
+        nk = _nk(k); val = _clean(v)
+        if   nk == 'maxnumbermimolayerspdsch':   result['mimo']   = _mimo_to_int(val)
+        elif nk == 'supportedmodulationorderdl': result['mod_dl'] = val.lower()
+        elif nk == 'supportedbandwidthdl':       result['bw_mhz'] = _parse_bw_mhz(val)
+        elif nk == 'supportedsubcarrierspacingdl': result['scs']  = val
+    return result
+
+def _get_all_dl_ids(fsc_entry):
+    ids = []
+    def _walk(node):
+        if isinstance(node, dict):
+            for k, v in node.items():
+                if _nk(k) == 'downlinksetnr':
+                    i = _to_int(v)
+                    if i: ids.append(i)
+                else: _walk(v)
+        elif isinstance(node, list):
+            for item in node: _walk(item)
+    _walk(fsc_entry)
+    return ids
+
+# ─── LTE: build caps from CA combos ──────────────────────────────────────────
+
+def _build_lte_band_caps_from_ca(eutra_tree):
+    band_caps = {}
+    for container in _find_all(eutra_tree, 'supportedbandcombination_r10',
+                               'supportedbandcombinationr10'):
+        for combo_block in _blocks(container):
+            for cc_block in _blocks(combo_block):
+                if not isinstance(cc_block, dict): continue
+                bn = _to_int(_clean(_get(cc_block, 'bandeutra_r10', 'bandeutra') or ''))
+                if bn is None: continue
+                dl_params = _get(cc_block, 'bandparametersdl_r10', 'bandparametersdl')
+                dl_entry  = _blocks(dl_params)[0] if dl_params and _blocks(dl_params) else {}
+                mimo_dl   = _mimo_to_int(_clean(
+                    _get(dl_entry, 'supportedmimo_capabilitydl_r10', 'supportedmimocapabilitydl') or ''))
+                if bn not in band_caps:
+                    band_caps[bn] = {'mimo_dl': mimo_dl, 'mimo_ul': 1}
+                elif mimo_dl and mimo_dl > (band_caps[bn].get('mimo_dl') or 0):
+                    band_caps[bn]['mimo_dl'] = mimo_dl
+    return band_caps
+
+def _extract_lte_bands(eutra_tree):
+    bands, seen = [], set()
+    rf = _get(eutra_tree, 'rf_parameters', 'rfparameters')
+    band_list_node = (_get(rf, 'supportedbandlisteutra') if rf else None) or \
+                     ((_find_all(eutra_tree, 'supportedbandlisteutra') or [None])[0])
+
+    band_caps    = _build_lte_band_caps_from_ca(eutra_tree)
+    global_dl256 = any(_to_bool(_clean(str(v))) for v in
+                       _find_all(eutra_tree, 'dl_256qam_r12', 'dl256qamr12'))
+    global_ul64  = any(_to_bool(_clean(str(v))) for v in
+                       _find_all(eutra_tree, 'ul_64qam_r12', 'ul64qamr12'))
+
+    def _add(bn, hd=None):
+        if bn in seen: return
+        seen.add(bn)
+        caps = band_caps.get(bn, {})
+        bands.append({
+            "band":         bn,
+            "mimoDl":       _sv(caps.get('mimo_dl')) if caps.get('mimo_dl') else None,
+            "mimoUl":       _sv(caps.get('mimo_ul', 1)),
+            "modulationDl": _sv("qam256") if global_dl256 else None,
+            "modulationUl": _sv("qam64")  if global_ul64  else None,
+            "powerClass":   None,
+            "extras": {
+                "bandEUTRA":           bn,
+                "halfDuplex":          hd if hd is not None else False,
+                "v1250_dl-256QAM-r12": "supported" if global_dl256 else "",
+                "v1250_ul-64QAM-r12":  "supported" if global_ul64  else "",
+            }
+        })
+
+    if band_list_node:
+        for entry in _blocks(band_list_node):
+            if not isinstance(entry, dict): continue
+            bn = _to_int(_clean(_get(entry, 'bandeutra', 'bandeutra_r10') or ''))
+            if bn is None: continue
+            hd = _to_bool(_clean(_get(entry, 'halfduplex', 'half_duplex') or ''))
+            _add(bn, hd)
+
+    # DFS fallback for any missed bands
+    for v in _find_all(eutra_tree, 'bandeutra', 'bandeutra_r10'):
+        bn = _to_int(_clean(str(v)))
+        if bn and 1 <= bn <= 700: _add(bn)
+
+    return bands
+
+# ─── NR: build caps from featureSet chain ────────────────────────────────────
+
+def _build_nr_band_caps(nr_tree, fsc_list, fs_tables):
+    band_best = {}
+    dl_list, per_cc = fs_tables.get('dl_list',[]), fs_tables.get('dl_per_cc',[])
+
+    rf = _get(nr_tree, 'rf_parameters', 'rfparameters')
+    containers = ([_get(rf, 'supportedbandcombinationlist')] if rf and
+                  _get(rf, 'supportedbandcombinationlist') else []) or \
+                 _find_all(nr_tree, 'supportedbandcombinationlist')
+
+    for container in containers:
+        for entry in _blocks(container):
+            if not isinstance(entry, dict): continue
+            fsc_id = _to_int(_clean(_get(entry, 'featuresetcombination') or ''))
+            if not fsc_id or fsc_id < 1 or fsc_id > len(fsc_list): continue
+
+            dl_ids = _get_all_dl_ids(fsc_list[fsc_id - 1])
+            bl = _get(entry, 'bandlist', 'band_list')
+            nr_bands = []
+            if isinstance(bl, dict):
+                nr_node = _get(bl, 'nr')
+                for item in ([nr_node] if isinstance(nr_node, dict) else
+                             (nr_node if isinstance(nr_node, list) else [])):
+                    bn = _to_int(_clean(_get(item, 'bandnr') or '')) if isinstance(item, dict) else None
+                    if bn: nr_bands.append(bn)
+            if not nr_bands:
+                for bnode in _find_all(entry, 'bandnr'):
+                    bn = _to_int(_clean(str(bnode)))
+                    if bn: nr_bands.append(bn)
+
+            valid_caps = [c for c in [_resolve_percc(d, dl_list, per_cc) for d in dl_ids] if c]
+            if not valid_caps: continue
+            primary = max(valid_caps, key=lambda c: c.get('bw_mhz') or 0)
+
+            for bn in nr_bands:
+                b = band_best.setdefault(bn, {'mimo':0,'mod_dl':None,'bw_mhz':0})
+                bw = primary.get('bw_mhz') or 0
+                if bw > b['bw_mhz']:
+                    b.update({'bw_mhz': bw,
+                              'mimo':   primary.get('mimo') or b['mimo'],
+                              'mod_dl': primary.get('mod_dl') or b['mod_dl']})
+                elif primary.get('mimo') and primary['mimo'] > b['mimo']:
+                    b['mimo'] = primary['mimo']
+    return band_best
+
+def _extract_nr_bands(nr_tree, fsc_list, fs_tables, raw_nr_text=''):
+    bands, seen = [], set()
+    band_best = _build_nr_band_caps(nr_tree, fsc_list, fs_tables)
+
+    containers = _find_all(nr_tree, 'supportedbandlistnr', 'bandlist')
+    entries = []
+    for c in containers: entries.extend(_blocks(c))
+
+    # Build BW map from raw text (bypasses tokenizer bug)
+    all_band_nums = []
+    for entry in entries:
+        if isinstance(entry, dict):
+            bn = _to_int(_clean(_get(entry, 'bandnr', 'band_nr') or ''))
+            if bn: all_band_nums.append(bn)
+    bw_map = _build_band_bw_map(raw_nr_text, all_band_nums) if raw_nr_text else {}
+
+    for entry in entries:
+        if not isinstance(entry, dict): continue
+        bn = _to_int(_clean(_get(entry, 'bandnr', 'band_nr') or ''))
+        if bn is None or bn in seen: continue
+        seen.add(bn)
+
+        mimo_params = _get(entry, 'mimo_parametersperband', 'mimoparametersperband') or {}
+        pc        = _clean(_get(mimo_params, 'ue_powerclass', 'uepowerclass') or '') or \
+                    _clean(_get(entry,        'ue_powerclass', 'uepowerclass') or '') or None
+        multi_tci = _clean(_get(mimo_params, 'multipletci') or '') or \
+                    _clean(_get(entry,        'multipletci') or '') or None
+        rate_match= _to_bool(_clean(_get(entry, 'ratematchingltecrs') or ''))
+        pusch_256 = _clean(_get(entry, 'pusch_256qam', 'pusch256qam') or '') or None
+
+        caps = band_best.get(bn, {})
+        bws  = bw_map.get(bn, [])
+
+        bands.append({
+            "band":               bn,
+            "mimoDl":             _sv(caps.get('mimo'))   if caps.get('mimo')   else None,
+            "mimoUl":             None,
+            "modulationDl":       _sv(caps.get('mod_dl')) if caps.get('mod_dl') else None,
+            "modulationUl":       _sv("qam256"),
+            "powerClass":         pc,
+            "bandwidths":         bws,
+            "rateMatchingLteCrs": rate_match,
+            "extras": {
+                "bandNR":                     bn,
+                "multipleTCI":                multi_tci,
+                "pusch-256QAM":               pusch_256,
+                "pucch-SpatialRelInfoMAC-CE":  _clean(_get(entry,'pucchspatialrelinfomacce') or '') or None,
+            }
+        })
+    return bands
+
+# ─── LTE CA ───────────────────────────────────────────────────────────────────
+
+def _extract_lte_ca(eutra_tree):
+    combos = []
+    for container in _find_all(eutra_tree, 'supportedbandcombination_r10',
+                               'supportedbandcombinationr10', 'supportedbandcombinationlist'):
+        for combo_block in _blocks(container):
+            if not isinstance(combo_block, dict): continue
+            components = []
+            for cc_block in _blocks(combo_block):
+                if not isinstance(cc_block, dict): continue
+                bn = _to_int(_clean(_get(cc_block, 'bandeutra_r10', 'bandeutra') or ''))
+                if bn is None: continue
+
+                dl_params = _get(cc_block, 'bandparametersdl_r10', 'bandparametersdl')
+                dl_entry  = (_blocks(dl_params)[0] if dl_params and _blocks(dl_params)
+                             else (dl_params if isinstance(dl_params,dict) else {}))
+                bw_dl   = _clean(_get(dl_entry, 'ca_bandwidthclassdl_r10', 'cabandwidthclassdl') or '').upper() or None
+                mimo_dl = _mimo_to_int(_get(dl_entry, 'supportedmimo_capabilitydl_r10', 'supportedmimocapabilitydl'))
+
+                ul_params = _get(cc_block, 'bandparametersul_r10', 'bandparametersul')
+                ul_entry  = (_blocks(ul_params)[0] if ul_params and _blocks(ul_params)
+                             else (ul_params if isinstance(ul_params,dict) else {}))
+                bw_ul = _clean(_get(ul_entry, 'ca_bandwidthclassul_r10', 'cabandwidthclassul') or '').upper() or None
+
+                components.append({
+                    "band":         bn,
+                    "bwClassDl":    bw_dl,
+                    "bwClassUl":    bw_ul,
+                    "mimoDl":       _sv(mimo_dl) if mimo_dl else None,
+                    "mimoUl":       _sv(1),
+                    "modulationDl": _sv("qam256"),
+                    "modulationUl": _sv("qam64"),
+                })
+            if components:
+                combos.append({"components": components, "bcs": _sv(0)})
+    return combos
+
+# ─── NR CA ────────────────────────────────────────────────────────────────────
+
+def _extract_nr_ca(nr_tree, fsc_list, fs_tables):
+    combos = []
+    dl_list, per_cc = fs_tables.get('dl_list',[]), fs_tables.get('dl_per_cc',[])
+
+    rf = _get(nr_tree, 'rf_parameters', 'rfparameters')
+    containers = ([_get(rf,'supportedbandcombinationlist')] if rf and
+                  _get(rf,'supportedbandcombinationlist') else []) or \
+                 _find_all(nr_tree, 'supportedbandcombinationlist')
+
+    for container in containers:
+        for entry in _blocks(container):
+            if not isinstance(entry, dict): continue
+            fsc_id = _to_int(_clean(_get(entry,'featuresetcombination') or ''))
+            bl = _get(entry, 'bandlist', 'band_list')
+            if bl is None: continue
+
+            nr_components = []
+            nr_node = _get(bl, 'nr')
+            for item in ([nr_node] if isinstance(nr_node,dict) else
+                         (nr_node if isinstance(nr_node,list) else [])):
+                if not isinstance(item, dict): continue
+                bn    = _to_int(_clean(_get(item,'bandnr','band_nr') or ''))
+                bw_dl = _clean(_get(item,'ca_bandwidthclassdl_nr','ca_bandwidthclassdl') or '').upper() or None
+                bw_ul = _clean(_get(item,'ca_bandwidthclassul_nr','ca_bandwidthclassul') or '').upper() or None
+                if bn: nr_components.append({"band":bn,"bwClassDl":bw_dl,"bwClassUl":bw_ul})
+
+            if not nr_components: continue
+
+            caps = {}
+            if fsc_id and 0 < fsc_id <= len(fsc_list):
+                valid = [c for c in [_resolve_percc(d,dl_list,per_cc)
+                                     for d in _get_all_dl_ids(fsc_list[fsc_id-1])] if c]
+                if valid: caps = max(valid, key=lambda c: c.get('bw_mhz') or 0)
+
+            scs_int = (int(re.search(r'(\d+)', caps['scs']).group(1))
+                       if caps.get('scs') and re.search(r'(\d+)', caps.get('scs','')) else None)
+
+            combos.append({
+                "components": [{
+                    "band":         c["band"],
+                    "bwClassDl":    c["bwClassDl"],
+                    "bwClassUl":    c["bwClassUl"],
+                    "mimoDl":       _sv(caps.get('mimo'))   if caps.get('mimo')   else None,
+                    "mimoUl":       _sv(1),
+                    "modulationDl": _sv(caps.get('mod_dl')) if caps.get('mod_dl') else None,
+                    "modulationUl": _sv("qam256"),
+                    "maxScs":       scs_int,
+                    "maxBwDl":      _sv(caps.get('bw_mhz')) if caps.get('bw_mhz') else None,
+                    "maxBwUl":      _sv(caps.get('bw_mhz')) if caps.get('bw_mhz') else None,
+                } for c in nr_components],
+                "bcs":        _sv(0),
+                "customData": [{"bandList": ",".join(str(c["band"]) for c in nr_components),
+                                "featureSetCombination": fsc_id}],
+            })
+    return combos
+
+# ─── MRDC ─────────────────────────────────────────────────────────────────────
+
+def _extract_mrdc(mrdc_tree, nr_fsc_list, fs_tables):
+    combos = []
+    dl_list, per_cc = fs_tables.get('dl_list',[]), fs_tables.get('dl_per_cc',[])
+
+    mrdc_fsc_raw  = _get(mrdc_tree, 'featuresetcombinations', 'featureSetCombinations')
+    mrdc_fsc_list = _blocks(mrdc_fsc_raw) if mrdc_fsc_raw else []
+
+    for container in _find_all(mrdc_tree, 'supportedbandcombinationlist'):
+        for entry in _blocks(container):
+            if not isinstance(entry, dict): continue
+            fsc_id = _to_int(_clean(_get(entry,'featuresetcombination') or ''))
+            bl = _get(entry, 'bandlist', 'band_list')
+            if bl is None: continue
+
+            # LTE components
+            lte_comps = []
+            eutra_node = _get(bl, 'eutra')
+            for item in ([eutra_node] if isinstance(eutra_node,dict) else
+                         (eutra_node if isinstance(eutra_node,list) else [])):
+                if not isinstance(item, dict): continue
+                bn    = _to_int(_clean(_get(item,'bandeutra','bandeutra_r10') or ''))
+                if bn is None: continue
+                bw_dl = _clean(_get(item,'ca_bandwidthclassdl_eutra','ca_bandwidthclassdl') or '').upper() or None
+                bw_ul = _clean(_get(item,'ca_bandwidthclassul_eutra','ca_bandwidthclassul') or '').upper() or None
+                lte_comps.append({"band":bn,"bwClassDl":bw_dl,"bwClassUl":bw_ul,
+                                   "mimoDl":_sv(2),"mimoUl":_sv(1),
+                                   "modulationDl":_sv("qam256"),"modulationUl":_sv("qam64")})
+
+            # NR components
+            nr_comps = []
+            nr_node = _get(bl, 'nr')
+            for item in ([nr_node] if isinstance(nr_node,dict) else
+                         (nr_node if isinstance(nr_node,list) else [])):
+                if not isinstance(item, dict): continue
+                bn    = _to_int(_clean(_get(item,'bandnr','band_nr') or ''))
+                if bn is None: continue
+                bw_dl = _clean(_get(item,'ca_bandwidthclassdl_nr','ca_bandwidthclassdl') or '').upper() or None
+                bw_ul = _clean(_get(item,'ca_bandwidthclassul_nr','ca_bandwidthclassul') or '').upper() or None
+
+                caps = {}
+                fsc_list_use = mrdc_fsc_list if mrdc_fsc_list else nr_fsc_list
+                if fsc_id and 0 < fsc_id <= len(fsc_list_use):
+                    is_mmwave = bn >= 257
+                    valid = [c for c in [_resolve_percc(d,dl_list,per_cc)
+                                         for d in _get_all_dl_ids(fsc_list_use[fsc_id-1])] if c]
+                    if valid:
+                        valid = ([c for c in valid if 'khz120' in _nk(c.get('scs','')) or
+                                   'khz240' in _nk(c.get('scs',''))] if is_mmwave else
+                                 [c for c in valid if 'khz120' not in _nk(c.get('scs',''))])
+                        if valid:
+                            caps = max(valid, key=lambda c: c.get('bw_mhz') or 0)
+
+                scs_int = (int(re.search(r'(\d+)',caps['scs']).group(1))
+                           if caps.get('scs') and re.search(r'(\d+)',caps.get('scs','')) else None)
+                nr_comps.append({"band":bn,"bwClassDl":bw_dl,"bwClassUl":bw_ul,
+                                  "mimoDl":_sv(caps.get('mimo')) if caps.get('mimo') else None,
+                                  "mimoUl":_sv(1),
+                                  "modulationDl":_sv(caps.get('mod_dl')) if caps.get('mod_dl') else None,
+                                  "modulationUl":_sv("qam256"),
+                                  "maxScs":scs_int,
+                                  "maxBwDl":_sv(caps.get('bw_mhz')) if caps.get('bw_mhz') else None,
+                                  "maxBwUl":_sv(caps.get('bw_mhz')) if caps.get('bw_mhz') else None})
+
+            if not lte_comps and not nr_comps: continue
+
+            mrdc_params = _get(entry, 'mrdc_parameters', 'mrdcparameters') or {}
+            dps  = _clean(_get(mrdc_params,'dynamicpowersharingendc') or '') or None
+            srxt = _clean(_get(mrdc_params,'simultaneousrxtxinterbandendc') or '') or None
+
+            combos.append({
+                "componentsLte": lte_comps,
+                "componentsNr":  nr_comps,
+                "bcsNr":         _sv(0),
+                "bcsEutra":      _sv(0),
+                "customData": [{
+                    "bandList": f"{','.join(str(c['band']) for c in lte_comps)},"
+                                f"{','.join(str(c['band']) for c in nr_comps)}".strip(','),
+                    "featureSetCombination":         fsc_id,
+                    "dynamicPowerSharingENDC":        dps,
+                    "simultaneousRxTxInterBandENDC":  srxt,
+                }],
+            })
+    return combos
+
+# ─── Main ─────────────────────────────────────────────────────────────────────
 
 def extract_all(text: str) -> dict:
     sections = _split_sections(text)
-
     eutra_tree = _unwrap(sections['eutra']) if 'eutra' in sections else {}
-    mrdc_tree = _unwrap(sections['mrdc']) if 'mrdc' in sections else {}
-    nr_tree = _unwrap(sections['nr']) if 'nr' in sections else {}
+    mrdc_tree  = _unwrap(sections['mrdc'])  if 'mrdc'  in sections else {}
+    nr_tree    = _unwrap(sections['nr'])    if 'nr'    in sections else {}
 
     if not eutra_tree and not mrdc_tree and not nr_tree:
         whole = parse_text(text)
-        eutra_tree = whole
-        mrdc_tree = whole
-        nr_tree = whole
+        eutra_tree = mrdc_tree = nr_tree = whole
 
-    fs_tables = _extract_fs_tables(nr_tree)
-    nr_fsc_raw = _get_val(nr_tree, 'featureSetCombinations', 'featuresetcombinations')
-    nr_fsc_list = _blocks(nr_fsc_raw) if nr_fsc_raw else []
+    fs_tables = _build_fs_tables(nr_tree)
+    fsc_raw   = _get(nr_tree, 'featuresetcombinations', 'featureSetCombinations')
+    fsc_list  = _blocks(fsc_raw) if fsc_raw else []
+
+    # Raw NR section text for bitmask extraction (bypasses tokenizer bug)
+    raw_nr_text = sections.get('nr', text)
 
     result = {
         "lteBands": _extract_lte_bands(eutra_tree),
-        "nrBands": _extract_nr_bands(nr_tree),
-        "lteca": _extract_lte_ca(eutra_tree),
-        "nrca": _extract_nr_ca(nr_tree, nr_fsc_list, fs_tables),
-        "mrdc": _extract_mrdc(mrdc_tree, nr_fsc_list, fs_tables),
+        "nrBands":  _extract_nr_bands(nr_tree, fsc_list, fs_tables, raw_nr_text),
+        "lteca":    _extract_lte_ca(eutra_tree),
+        "nrca":     _extract_nr_ca(nr_tree, fsc_list, fs_tables),
+        "mrdc":     _extract_mrdc(mrdc_tree, fsc_list, fs_tables),
     }
 
-    print(f"[EXTRACT] FINAL: LTE bands={len(result['lteBands'])}, "
-          f"NR bands={len(result['nrBands'])}, LTE-CA={len(result['lteca'])}, "
-          f"NR-CA={len(result['nrca'])}, MRDC={len(result['mrdc'])}",
+    print(f"[EXTRACT] LTE={len(result['lteBands'])} NR={len(result['nrBands'])} "
+          f"LTECA={len(result['lteca'])} NRCA={len(result['nrca'])} MRDC={len(result['mrdc'])}",
           file=sys.stderr)
-
     return result
-
 
 if __name__ == "__main__":
     import json
     path = sys.argv[1] if len(sys.argv) > 1 else "UE_Capa.txt"
-    data = extract_all(open(path, errors="replace").read())
-    print(json.dumps({
-        "lteBands": len(data["lteBands"]),
-        "nrBands": len(data["nrBands"]),
-        "lteca": len(data["lteca"]),
-        "nrca": len(data["nrca"]),
-        "mrdc": len(data["mrdc"]),
-    }, indent=2))
+    data = extract_all(open(path, errors='replace').read())
+    print(json.dumps({k: len(v) for k, v in data.items()}, indent=2))
+    if data['lteBands']: print("\nLTE B0:", json.dumps(data['lteBands'][0],  indent=2))
+    if data['nrBands']:  print("\nNR B0:",  json.dumps(data['nrBands'][0],   indent=2))
+    if data['lteca']:    print("\nCA0:",    json.dumps(data['lteca'][0],     indent=2))
+    if data['mrdc']:     print("\nMRDC0:",  json.dumps(data['mrdc'][0],      indent=2))

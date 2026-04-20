@@ -58,17 +58,21 @@ def run_hybrid_pipeline(raw_text: str, parsed_json: Dict[str, Any]) -> Dict[str,
     start = time.time()
 
     # ── Step 0: Deterministic Decoder Hook ────────────────────────────────
+    start_step = time.perf_counter()
     # Decode bitmap NR bandwidths strictly before any GAP detection or AI runs
     from .bitmap_decoder import fill_nr_bandwidths
     parsed_json = fill_nr_bandwidths(parsed_json, raw_text)
+    print(f"[TIME] Bitmap Extraction + Decode: {time.perf_counter() - start_step:.4f}s")
 
     # ── Step 1: Snapshot pre-pipeline counts ───────────────────────────────
     pre_counts = _snapshot_counts(parsed_json)
     log.info(f"[Pipeline] Pre-pipeline: {pre_counts}")
 
     # ── Step 2: Gap detection ─────────────────────────────────────────────
+    start_step = time.perf_counter()
     gap_report = detect_gaps(parsed_json)
     gaps = gap_report["gaps"]
+    print(f"[TIME] Gap Detection: {time.perf_counter() - start_step:.4f}s")
     log.info(f"[Pipeline] Detected {gap_report['gap_count']} gap(s) "
              f"(critical: {gap_report['has_critical']})")
 
@@ -82,11 +86,14 @@ def run_hybrid_pipeline(raw_text: str, parsed_json: Dict[str, Any]) -> Dict[str,
 
     # ── Step 3: AI Assist (only if gaps exist) ────────────────────────────
     if gaps:
+        start_step = time.perf_counter()
         ai_result = ai_fill_gaps(raw_text, gaps)
+        print(f"[TIME] AI Assist: {time.perf_counter() - start_step:.4f}s")
         ai_called = ai_result["ai_called"]
 
         if ai_called and ai_result["fills"]:
             # ── Step 4: Validate AI output ─────────────────────────────────
+            start_step = time.perf_counter()
             validated_fills, rejections = validate_ai_output(ai_result["fills"], gaps)
             rejection_reasons = rejections
             ai_rejected = len(rejections)
@@ -95,6 +102,7 @@ def run_hybrid_pipeline(raw_text: str, parsed_json: Dict[str, Any]) -> Dict[str,
                 # ── Step 5: Safe merge ─────────────────────────────────────
                 parsed_json, filled_fields = safe_merge(parsed_json, validated_fills)
                 ai_accepted = len(filled_fields)
+                print(f"[TIME] Validation + Merge: {time.perf_counter() - start_step:.4f}s")
                 log.info(f"[Pipeline] Merged {ai_accepted} AI fill(s)")
             else:
                 warnings.append("AI returned data but none passed validation")
@@ -119,7 +127,9 @@ def run_hybrid_pipeline(raw_text: str, parsed_json: Dict[str, Any]) -> Dict[str,
         log.warning(f"[Pipeline] Count verification issues: {verification['issues']}")
 
     # ── Step 8: AI Enrichment (ONE global call) ───────────────────────────
+    start_step = time.perf_counter()
     enrichment = ai_enrich_global(parsed_json)
+    print(f"[TIME] AI Enrichment: {time.perf_counter() - start_step:.4f}s")
 
     # ── Step 9: Attach provenance + enrichment to output ──────────────────
     elapsed = round(time.time() - start, 3)
